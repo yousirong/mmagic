@@ -1,44 +1,51 @@
-from mmagic.models.backbones import DeiT
 import torch
 import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed
+import timm
 
 class DiTwithDeiT(nn.Module):
     def __init__(
             self,
-            deit_config,
-            input_size=32,
+            deit_model='deit_base_patch16_224',  # 사용할 DeiT 모델 선택
+            img_size=32,  # input_size를 img_size로 변경
             patch_size=4,
             in_channels=4,
             hidden_size=768,
-            num_classes=1000
+            num_classes=1000,
+            depth=12,
+            num_heads=12
         ):
         super().__init__()
-        # MMagic의 DeiT 모델을 사용하여 DeiT backbone을 생성
-        self.deit_backbone = DeiT(**deit_config)
 
-        # 기존 DiT 구조와 통합할 다른 모듈 (x_embedder, t_embedder, y_embedder)
-        self.x_embedder = PatchEmbed(input_size=input_size, patch_size=patch_size, in_channels=in_channels, embed_dim=hidden_size)
+        # TIMM 라이브러리를 사용하여 DeiT 모델 불러오기
+        self.deit_backbone = timm.create_model(deit_model, pretrained=True)
+
+        # DeiT 모델의 임베딩 레이어를 덮어쓰기 위해 PatchEmbed 사용
+        self.x_embedder = PatchEmbed(img_size=(img_size, img_size), patch_size=patch_size, in_chans=in_channels, embed_dim=hidden_size)
+
+        # 기존 DiT 구조에 필요한 임베딩 레이어들
         self.t_embedder = TimestepEmbedder(hidden_size=hidden_size)
         self.y_embedder = LabelEmbedder(num_classes=num_classes, hidden_size=hidden_size, dropout_prob=0.1)
 
-        # DeiT와 결합된 transformer block을 사용할 수 있도록 설정
+        # 최종 레이어 설정
         self.final_layer = FinalLayer(hidden_size=hidden_size, patch_size=patch_size, out_channels=in_channels)
 
     def forward(self, x, t, y):
-        # Embedding 및 timestep embeddings
+        # 임베딩 및 timestep 임베딩
         x = self.x_embedder(x)
         t = self.t_embedder(t)
         y = self.y_embedder(y, self.training)
 
-        # DeiT backbone을 사용한 transformer 블록 통과
-        deit_output = self.deit_backbone(x + t + y)
+        # DeiT 백본을 통해 데이터 처리
+        deit_output = self.deit_backbone.forward_features(x + t + y)
 
-        # 최종적으로 DiT의 final layer를 사용
+        # 최종 레이어 처리
         output = self.final_layer(deit_output, t + y)
         return output
+
+
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -46,7 +53,6 @@ class DiTwithDeiT(nn.Module):
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
@@ -75,7 +81,6 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
 class LabelEmbedder(nn.Module):
     def __init__(self, num_classes, hidden_size, dropout_prob):
         super().__init__()
@@ -99,7 +104,6 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
-
 #################################################################################
 #                                 Final Layer                                   #
 #################################################################################
@@ -119,7 +123,6 @@ class FinalLayer(nn.Module):
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
-
 
 #################################################################################
 #                   Sine/Cosine Positional Embedding Functions                  #
@@ -162,40 +165,41 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 
 def DiTwithDeiT_XL_2(**kwargs):
-    return DiTwithDeiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return DiTwithDeiT(hidden_size=1152, patch_size=2, depth=28, num_heads=16, **kwargs)
 
 def DiTwithDeiT_XL_4(**kwargs):
-    return DiTwithDeiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+    return DiTwithDeiT(hidden_size=1152, patch_size=4, depth=28, num_heads=16, **kwargs)
 
 def DiTwithDeiT_XL_8(**kwargs):
-    return DiTwithDeiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+    return DiTwithDeiT(hidden_size=1152, patch_size=8, depth=28, num_heads=16, **kwargs)
 
 def DiTwithDeiT_L_2(**kwargs):
-    return DiTwithDeiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+    return DiTwithDeiT(hidden_size=1024, patch_size=2, depth=24, num_heads=16, **kwargs)
 
 def DiTwithDeiT_L_4(**kwargs):
-    return DiTwithDeiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+    return DiTwithDeiT(hidden_size=1024, patch_size=4, depth=24, num_heads=16, **kwargs)
 
 def DiTwithDeiT_L_8(**kwargs):
-    return DiTwithDeiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+    return DiTwithDeiT(hidden_size=1024, patch_size=8, depth=24, num_heads=16, **kwargs)
 
 def DiTwithDeiT_B_2(**kwargs):
-    return DiTwithDeiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return DiTwithDeiT(hidden_size=768, patch_size=2, depth=12, num_heads=12, **kwargs)
 
 def DiTwithDeiT_B_4(**kwargs):
-    return DiTwithDeiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+    return DiTwithDeiT(hidden_size=768, patch_size=4, depth=12, num_heads=12, **kwargs)
 
 def DiTwithDeiT_B_8(**kwargs):
-    return DiTwithDeiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+    return DiTwithDeiT(hidden_size=768, patch_size=8, depth=12, num_heads=12, **kwargs)
 
 def DiTwithDeiT_S_2(**kwargs):
-    return DiTwithDeiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+    return DiTwithDeiT(hidden_size=384, patch_size=2, depth=12, num_heads=6, **kwargs)
 
 def DiTwithDeiT_S_4(**kwargs):
-    return DiTwithDeiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+    return DiTwithDeiT(hidden_size=384, patch_size=4, depth=12, num_heads=6, **kwargs)
 
 def DiTwithDeiT_S_8(**kwargs):
-    return DiTwithDeiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+    return DiTwithDeiT(hidden_size=384, patch_size=8, depth=12, num_heads=6, **kwargs)
+
 
 
 DiTwithDeiT_models = {
