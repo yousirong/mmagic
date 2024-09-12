@@ -8,10 +8,10 @@ import timm
 class DiTwithDeiT(nn.Module):
     def __init__(
             self,
-            deit_model='deit_base_patch16_224',  # 사용할 DeiT 모델 선택
-            img_size=32,  # input_size를 img_size로 변경
+            deit_model='deit_base_patch16_224',
+            img_size=32,  # CIFAR-10의 이미지 크기에 맞게 설정
             patch_size=4,
-            in_channels=4,
+            in_channels=4,  # CIFAR-10은 RGB 이미지이므로 입력 채널 3
             hidden_size=768,
             num_classes=1000,
             depth=12,
@@ -33,17 +33,29 @@ class DiTwithDeiT(nn.Module):
         self.final_layer = FinalLayer(hidden_size=hidden_size, patch_size=patch_size, out_channels=in_channels)
 
     def forward(self, x, t, y):
-        # 임베딩 및 timestep 임베딩
-        x = self.x_embedder(x)
-        t = self.t_embedder(t)
-        y = self.y_embedder(y, self.training)
+        # x의 차원이 4차원이 아니면 변환
+        if len(x.shape) == 3:
+            x = x.unsqueeze(0)  # 배치 차원을 추가
 
-        # DeiT 백본을 통해 데이터 처리
-        deit_output = self.deit_backbone.forward_features(x + t + y)
+        # t와 y 임베딩 추가
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y, self.training)
+
+        # x 임베딩 처리
+        x = self.x_embedder(x)
+
+        # t_emb와 y_emb의 차원을 맞춰주기
+        t_emb = t_emb[:, None, None, :]  # (B, 1, 1, hidden_size)
+        y_emb = y_emb[:, None, None, :]  # (B, 1, 1, hidden_size)
+
+        # x + t_emb + y_emb
+        deit_output = self.deit_backbone.forward_features(x + t_emb + y_emb)
 
         # 최종 레이어 처리
-        output = self.final_layer(deit_output, t + y)
+        output = self.final_layer(deit_output, t_emb.squeeze(1) + y_emb.squeeze(1))
+
         return output
+
 
 
 

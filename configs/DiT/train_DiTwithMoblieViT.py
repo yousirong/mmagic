@@ -1,12 +1,17 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+
+"""
+A minimal training script for MobileViT DiT using PyTorch DDP.
+"""
 import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import CIFAR10  # CIFAR-10 데이터셋 로드
+from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
 from collections import OrderedDict
@@ -18,9 +23,10 @@ import argparse
 import logging
 import os
 
-from DiTwithDeiT_model import DiTwithDeiT_models  # DiTwithDeiT 모델 로드
+from models_DiTwithMobileViT import MobileViT_DiT_configs  # Import the MobileViT DiT models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -53,11 +59,11 @@ def cleanup():
     dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, rank):
     """
-    Create a logger that writes to a log file and stdout.
+    Create a logger that writes to a log file and stdout. Only for rank 0.
     """
-    if dist.get_rank() == 0:  # real logger
+    if rank == 0:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -70,21 +76,42 @@ def create_logger(logging_dir):
         logger.addHandler(logging.NullHandler())
     return logger
 
+
+def center_crop_arr(pil_image, image_size):
+    """
+    Center cropping implementation.
+    """
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+        )
+
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+    )
+
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+
 #################################################################################
 #                                  Training Loop                                #
 #################################################################################
 
 def main(args):
     """
-    Trains a new DiT model.
+    Trains a new MobileViT-DiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", init_method='env://')
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    device = torch.device(f"cuda:{args.local_rank}")
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
@@ -94,48 +121,39 @@ def main(args):
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
+        model_string_name = args.model.replace("/", "-")  # e.g., MobileViT-DiT-S/2 --> MobileViT-DiT-S-2 (for naming folders)
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
-        logger = create_logger(None)
+        logger = create_logger(None, rank)
+
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
-    model = DiTwithDeiT_models[args.model](
-        img_size=224,  # 모델이 224x224 크기의 이미지를 받도록 설정
-        num_classes=args.num_classes
-    )
-
+    model = MobileViT_DiT_configs[args.model](input_size=latent_size, num_classes=args.num_classes)
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
     model = DDP(model.to(device), device_ids=[rank])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    logger.info(f"DiTwithDeiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    logger.info(f"MobileViT DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
-    # Setup data with resizing to 224x224:
+    # Setup data:
     transform = transforms.Compose([
-        transforms.Resize((224, 224)),  # 이미지 크기를 224x224로 조정
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
-        transforms.Lambda(lambda x: torch.cat((x, x[:1, :, :]), dim=0))
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-
-
-
-    # CIFAR-10 데이터셋 로드
-    dataset = CIFAR10(root=args.data_path, train=True, download=True, transform=transform)
-    
+    dataset = ImageFolder(args.data_path, transform=transform)
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -172,11 +190,9 @@ def main(args):
         for x, y in loader:
             x = x.to(device)
             y = y.to(device)
-            # with torch.no_grad():
-            #     # Map input images to latent space + normalize latents:
-            #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            print(x.size())  # x의 크기가 (batch_size, 3, 224, 224)인지 확인
-
+            with torch.no_grad():
+                # Map input images to latent space + normalize latents:
+                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -205,7 +221,7 @@ def main(args):
                 log_steps = 0
                 start_time = time()
 
-            # Save DiTwithDeiT checkpoint:
+            # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
@@ -225,21 +241,40 @@ def main(args):
     logger.info("Done!")
     cleanup()
 
-
 if __name__ == "__main__":
-    # Default args here will train DiTwithDeiT-XL/2 with the hyperparameters.
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiTwithDeiT_models.keys()), default="DiTwithDeiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[224, 256, 512], default=224)  # 모델이 사용할 이미지 크기
+    parser.add_argument("--model", type=str, choices=list(MobileViT_DiT_configs.keys()), default="MobileViT-DiT-S/2")
+    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=1)
+    parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--local-rank", type=int, default=0)  # Add this line
     args = parser.parse_args()
     main(args)
+
+"""
+torchrun --nproc_per_node=1 \
+    train_DiTwithMoblieViT.py \
+    --data-path /home/juneyonglee/mydata/datasets/train \
+    --results-dir ./result \
+    --model MobileViT-DiT-S/2 \
+    --image-size 256 \
+    --num-classes 1000 \
+    --epochs 10 \
+    --global-batch-size 64 \
+    --global-seed 42 \
+    --vae ema \
+    --num-workers 8 \
+    --log-every 1 \
+    --ckpt-every 2 \
+    --local-rank 0
+
+
+"""
