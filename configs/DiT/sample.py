@@ -1,11 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 """
-Sample new images from a pre-trained DiT.
+Sample new images from a pre-trained DiT or DiT_Lightweight.
 """
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -15,6 +12,7 @@ from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from download import find_model
 from models import DiT_models
+from models_lightweight import DiT_Lightweight_models  # DiT_Lightweight_models import 추가
 import argparse
 
 
@@ -31,12 +29,23 @@ def main(args):
 
     # Load model:
     latent_size = args.image_size // 8
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        num_classes=args.num_classes
-    ).to(device)
+
+    # DiT_Lightweight 모델과 DiT 모델을 구분하여 불러오는 로직 추가
+    if args.model in DiT_models:
+        model = DiT_models[args.model](
+            input_size=latent_size,
+            num_classes=args.num_classes
+        ).to(device)
+    elif args.model in DiT_Lightweight_models:
+        model = DiT_Lightweight_models[args.model](
+            input_size=latent_size,
+            num_classes=args.num_classes
+        ).to(device)
+    else:
+        raise ValueError(f"Model {args.model} not found in available models.")
+
     # Auto-download a pre-trained model or load a custom DiT checkpoint from train.py:
-    ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+    ckpt_path = args.ckpt or f"{args.model.replace('/', '-')}-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
@@ -65,12 +74,14 @@ def main(args):
     samples = vae.decode(samples / 0.18215).sample
 
     # Save and display images:
-    save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
+    save_image(samples, "sample1.png", nrow=4, normalize=True, value_range=(-1, 1))
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    # DiT_Lightweight 모델도 선택할 수 있도록 model choices를 확장
+    all_model_choices = list(DiT_models.keys()) + list(DiT_Lightweight_models.keys())
+    parser.add_argument("--model", type=str, choices=all_model_choices, default="DiT-XL/2")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
@@ -78,6 +89,6 @@ if __name__ == "__main__":
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+                        help="Optional path to a DiT or DiT_Lightweight checkpoint (default: auto-download a pre-trained model).")
     args = parser.parse_args()
     main(args)

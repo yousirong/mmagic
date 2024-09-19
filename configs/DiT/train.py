@@ -1,12 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-"""
-A minimal training script for DiT using PyTorch DDP.
-"""
 import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -17,6 +8,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
+from torch.utils.tensorboard import SummaryWriter  # SummaryWriter 추가
 import numpy as np
 from collections import OrderedDict
 from PIL import Image
@@ -28,6 +20,7 @@ import logging
 import os
 
 from models import DiT_models
+from models_lightweight import DiT_Lightweight_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
@@ -45,7 +38,6 @@ def update_ema(ema_model, model, decay=0.9999):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
@@ -85,7 +77,6 @@ def create_logger(logging_dir):
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
-    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
     """
     while min(*pil_image.size) >= 2 * image_size:
         pil_image = pil_image.resize(
@@ -133,16 +124,28 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+
+        writer = SummaryWriter(experiment_dir)  # TensorBoard writer 추가
     else:
         logger = create_logger(None)
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        num_classes=args.num_classes
-    )
+    # Create model:
+    if args.model in DiT_models:
+        model = DiT_models[args.model](
+            input_size=latent_size,
+            num_classes=args.num_classes
+        )
+    elif args.model in DiT_Lightweight_models:
+        model = DiT_Lightweight_models[args.model](
+            input_size=latent_size,
+            num_classes=args.num_classes
+        )
+    else:
+        raise ValueError(f"Model {args.model} not found in available models.")
+
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -224,6 +227,12 @@ def main(args):
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+
+                if rank == 0:
+                    # TensorBoard 기록
+                    writer.add_scalar('Loss/Train', avg_loss, train_steps)
+                    writer.add_scalar('Speed/Train Steps per Sec', steps_per_sec, train_steps)
+
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -246,6 +255,9 @@ def main(args):
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
+    if rank == 0:
+        writer.close()  # 훈련 종료 후 writer 닫기
+
     logger.info("Done!")
     cleanup()
 
@@ -255,15 +267,40 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
+    all_model_choices = list(DiT_models.keys()) + list(DiT_Lightweight_models.keys())
+    parser.add_argument("--model", type=str, choices=all_model_choices, default="DiT_Lightweight-S/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     args = parser.parse_args()
     main(args)
+
+
+"""
+torchrun --nproc_per_node=1 \
+    train.py \
+    --data-path /home/juneyonglee/mydata/datasets/train \
+    --results-dir /home/juneyonglee/mydata/results \
+    --model DiT_Lightweight-S/2 \
+    --image-size 256 \
+    --num-classes 1000 \
+    --epochs 20 \
+    --global-batch-size 32 \
+    --global-seed 42 \
+    --vae ema \
+    --num-workers 8 \
+    --log-every 100 \
+    --ckpt-every 5000
+
+"""
+
+"""
+imaagenet 2012
+항목 1,282,167개, 크기 147.0 GB
+"""

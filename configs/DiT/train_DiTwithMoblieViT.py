@@ -268,13 +268,11 @@ torchrun --nproc_per_node=1 \
     --image-size 256 \
     --num-classes 1000 \
     --epochs 10 \
-    --global-batch-size 64 \
+    --global-batch-size 16 \
     --global-seed 42 \
     --vae ema \
     --num-workers 8 \
     --log-every 1 \
     --ckpt-every 2 \
     --local-rank 0
-
-
 """

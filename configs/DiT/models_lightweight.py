@@ -15,6 +15,7 @@ import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from linear_attention import LinearAttention
+from linformer import Linformer  # Linformer 패키지 필요
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -95,12 +96,38 @@ class LabelEmbedder(nn.Module):
 
 
 #################################################################################
-#                                 Core DiT Model                                #
+#                                 Core DiT_Lightweight Model                                #
 #################################################################################
+
+
+
+class LightweightTransformerBlock(nn.Module):
+    def __init__(self, hidden_size, num_heads, seq_len, k=256):
+        super(LightweightTransformerBlock, self).__init__()
+        # Linformer: Reduce the sequence length in attention
+        self.attn = Linformer(
+            dim=hidden_size,
+            seq_len=seq_len,
+            depth=1,  # depth는 쌓을 블록 개수로, DiT의 depth에 따라 설정 가능
+            heads=num_heads,
+            k=k  # 압축된 attention의 크기
+        )
+        self.norm1 = nn.LayerNorm(hidden_size)
+        self.norm2 = nn.LayerNorm(hidden_size)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 4),
+            nn.GELU(),
+            nn.Linear(hidden_size * 4, hidden_size),
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 class DiTBlock(nn.Module):
     """
-    A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
+    A DiT_Lightweight block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
@@ -124,7 +151,7 @@ class DiTBlock(nn.Module):
 
 class FinalLayer(nn.Module):
     """
-    The final layer of DiT.
+    The final layer of DiT_Lightweight.
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
@@ -142,18 +169,15 @@ class FinalLayer(nn.Module):
         return x
 
 
-class DiT(nn.Module):
-    """
-    Diffusion model with a Transformer backbone.
-    """
+class DiT_Lightweight(nn.Module):
     def __init__(
         self,
         input_size=32,
         patch_size=2,
         in_channels=4,
-        hidden_size=1152,
-        depth=28,
-        num_heads=16,
+        hidden_size=384,
+        depth=12,  # 경량 트랜스포머 블록의 개수
+        num_heads=6,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
@@ -166,16 +190,21 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
+        # Patch embedding
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
+        # Fixed sin-cos positional embeddings
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.x_embedder.num_patches, hidden_size), requires_grad=False)
+
+        # Lightweight Transformer blocks
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            LightweightTransformerBlock(hidden_size, num_heads, seq_len=self.x_embedder.num_patches)
+            for _ in range(depth)
         ])
+
+        # Final layer
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -188,33 +217,9 @@ class DiT(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
+        # Initialize (and freeze) pos_embed by sin-cos embedding
         pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
         self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
-
-        # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
-        w = self.x_embedder.proj.weight.data
-        nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
-        nn.init.constant_(self.x_embedder.proj.bias, 0)
-
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
-
-        # Initialize timestep embedding MLP:
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-
     def unpatchify(self, x):
         """
         x: (N, T, patch_size**2 * C)
@@ -231,25 +236,24 @@ class DiT(nn.Module):
         return imgs
 
     def forward(self, x, t, y):
-        """
-        Forward pass of DiT.
-        x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
-        t: (N,) tensor of diffusion timesteps
-        y: (N,) tensor of class labels
-        """
-        x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        # Embeddings
+        x = self.x_embedder(x) + self.pos_embed  # Patch embedding + positional embedding
+        t = self.t_embedder(t)
+        y = self.y_embedder(y, self.training)
+        c = t + y
+
+        # Transformer blocks
         for block in self.blocks:
-            x = block(x, c)                      # (N, T, D)
-        x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
-        x = self.unpatchify(x)                   # (N, out_channels, H, W)
+            x = block(x)
+
+        # Final layer
+        x = self.final_layer(x, c)
+        x = self.unpatchify(x)
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """
-        Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
+        Forward pass of DiT_Lightweight, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
@@ -322,49 +326,49 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
 
 #################################################################################
-#                                   DiT Configs                                  #
+#                                   DiT_Lightweight Configs                                  #
 #################################################################################
 
 def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return DiT_Lightweight(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
 
 def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+    return DiT_Lightweight(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
 
 def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+    return DiT_Lightweight(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
 
 def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+    return DiT_Lightweight(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
 
 def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+    return DiT_Lightweight(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
 
 def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+    return DiT_Lightweight(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
 
 def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+    return DiT_Lightweight(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
 
 def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+    return DiT_Lightweight(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
 
 def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+    return DiT_Lightweight(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
 
 def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+    return DiT_Lightweight(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
 
 def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+    return DiT_Lightweight(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
 
 def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+    return DiT_Lightweight(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
 
 
-DiT_models = {
-    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
-    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
-    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+DiT_Lightweight_models = {
+    'DiT_Lightweight-XL/2': DiT_XL_2,  'DiT_Lightweight-XL/4': DiT_XL_4,  'DiT_Lightweight-XL/8': DiT_XL_8,
+    'DiT_Lightweight-L/2':  DiT_L_2,   'DiT_Lightweight-L/4':  DiT_L_4,   'DiT_Lightweight-L/8':  DiT_L_8,
+    'DiT_Lightweight-B/2':  DiT_B_2,   'DiT_Lightweight-B/4':  DiT_B_4,   'DiT_Lightweight-B/8':  DiT_B_8,
+    'DiT_Lightweight-S/2':  DiT_S_2,   'DiT_Lightweight-S/4':  DiT_S_4,   'DiT_Lightweight-S/8':  DiT_S_8,
 }

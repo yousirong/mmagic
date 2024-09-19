@@ -3,17 +3,10 @@ import torch.nn as nn
 import math
 from timm.models.vision_transformer import PatchEmbed
 from mmpretrain.models.backbones import MobileViT
-from mmagic.registry import MODELS
+from models import DiTBlock
 
 def modulate(x, shift, scale):
-    # Reshape shift and scale to match x's shape if needed
-    shift = shift.view(x.size(0), -1, 1, 1)  # Ensure shift has shape [batch_size, channels, 1, 1]
-    scale = scale.view(x.size(0), -1, 1, 1)  # Ensure scale has shape [batch_size, channels, 1, 1]
-    return x * (1 + scale) + shift
-
-#################################################################################
-#               Embedding Layers for Timesteps and Class Labels                 #
-#################################################################################
+    return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, hidden_size, frequency_embedding_size=256):
@@ -63,43 +56,36 @@ class LabelEmbedder(nn.Module):
         embeddings = self.embedding_table(labels)
         return embeddings
 
-#################################################################################
-#                                 Core MobileViT DiT Model                      #
-#################################################################################
 
 class FinalLayer(nn.Module):
     """
-    The final layer of DiT.
+    The final layer of the DiT model, which converts the final transformer output into image space.
     """
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm(128, elementwise_affine=False, eps=1e-6)  # Updated to match MobileViT output channels
-        self.linear = nn.Linear(128, patch_size * patch_size * out_channels, bias=True)  # Updated to 128 channels
+        self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 2 * 128, bias=True)  # Update to match 128-channel output
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
         )
 
     def forward(self, x, c):
-        # Flatten the spatial dimensions to get a 2D tensor
-        x = x.view(x.size(0), -1)  # From [64, 128, 1, 1] to [64, 128]
-        
         shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
         x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
 
-# Update the MobileViT_DiT class initialization
 class MobileViT_DiT(nn.Module):
     def __init__(
         self,
-        input_size=256,  # Updated to 256 to match your ImageNet dataset
+        input_size=256,
         patch_size=2,
-        in_channels=3,  # Updated to 3 for RGB inputs
-        hidden_size=384,   # Use 384 to match the MobileViT's expected input
-        depth=12,          
-        num_heads=6,       
+        in_channels=3,
+        hidden_size=384,  # MobileViT 출력 채널 수와 맞춤
+        depth=12,
+        num_heads=6,
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
@@ -112,21 +98,25 @@ class MobileViT_DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
 
-        # Ensure PatchEmbed outputs the correct number of channels
-        self.x_embedder = PatchEmbed(input_size, patch_size, 3, hidden_size)  # Outputs 384 channels now
+        # MobileViT 로드 및 채널 조정
+        self.mobilevit = MobileViT(arch='small', in_channels=in_channels, out_indices=(3,))
 
+        # MobileViT의 출력 채널 수를 hidden_size로 맞추기 위한 Conv2d 레이어 (128 -> 384로 변환)
+        self.conv_to_transformer = nn.Conv2d(128, hidden_size, kernel_size=1)
+
+        # DiT 관련 설정
+        self.x_embedder = PatchEmbed(input_size, patch_size, hidden_size, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        num_patches = self.x_embedder.num_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        # Add a convolution to ensure input to MobileViT has 384 channels
-        self.pre_mobilevit_conv = nn.Conv2d(384, hidden_size, kernel_size=1)  # Channel conversion to 384
-
-        # MobileViT expects input channels to match PatchEmbed's output
-        self.mobilevit = MobileViT(arch='small', in_channels=hidden_size, out_indices=(3,))  # MobileViT receives 384 channels
-
+        self.blocks = nn.ModuleList([
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+        ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
-        
+
     def initialize_weights(self):
         w = self.x_embedder.proj.weight.data
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
@@ -137,84 +127,44 @@ class MobileViT_DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def unpatchify(self, x):
-        c = self.out_channels
-        p = self.patch_size
-
-        print(f"Initial x.shape: {x.shape}")
-        
-        if x.shape[2] == 1 and x.shape[3] == 1:
-            num_patches = x.shape[1]
-            h = w = int(math.sqrt(num_patches))
-            print(f"Handling 1x1 spatial dimensions. Computed h={h}, w={w}, num_patches={num_patches}")
-
-            assert h * w == num_patches, f"Expected h * w to match x.shape[1], but got h={h}, w={w}, and x.shape[1]={num_patches}"
-
-            x = x.view(x.shape[0], c, h, w)
-            x = x.repeat(1, 1, p, p)
-        else:
-            num_patches = x.shape[1]
-            h = w = int(math.sqrt(num_patches))
-            print(f"Handling general case. Computed h={h}, w={w}, num_patches={num_patches}")
-            
-            assert h * w == num_patches, f"Expected h * w to match x.shape[1], but got h={h}, w={w}, and x.shape[1]={num_patches}"
-            x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
-            x = torch.einsum('nhwpqc->nchpwq', x)
-            x = x.reshape(shape=(x.shape[0], c, h * p, w * p))
-
-        print(f"Final x.shape: {x.shape}")
-        return x
-
-
-
-
     def forward(self, x, t, y):
-        print("Input shape before slice:", x.shape)  # Check initial input shape
-        if x.shape[1] == 4:  # If input has 4 channels, keep only the first 3 (RGB)
-            x = x[:, :3, :, :]
-        print("Input shape after slice:", x.shape)  # Check after slicing
-        x = self.x_embedder(x)
-        print("After PatchEmbed:", x.shape)  # Check after embedding
-        
-        # Reshape the output of PatchEmbed to have 4 dimensions
-        # Reshape the output of PatchEmbed to have 4 dimensions
-        batch_size, num_patches, hidden_size = x.shape
-        height = width = int(math.sqrt(num_patches))  # Assuming square patches
-        x = x.reshape(batch_size, hidden_size, height, width)  # Use reshape instead of view
-        print(f"After reshaping PatchEmbed: {x.shape}")
-        
-        # Add pre-MobileViT convolution
-        x = self.pre_mobilevit_conv(x)
-        
-        # Check the shape of x before feeding to MobileViT
-        print(f"Shape before MobileViT: {x.shape}")
-        
+        # MobileViT로 특징 추출
+        x = self.mobilevit(x)[0]  # MobileViT 출력
+        print(f"MobileViT output shape: {x.shape}")  # MobileViT의 출력 확인
+        x = self.conv_to_transformer(x)  # 채널 수 맞춤
+        print(f"After conv_to_transformer shape: {x.shape}")
+        x = x.flatten(2).transpose(1, 2)  # Transformer가 처리할 수 있게 변경
+
+        # Positional embedding 추가
+        x = x + self.pos_embed
+
         t = self.t_embedder(t)
         y = self.y_embedder(y, self.training)
-        c = t + y
-        print("Combined shape (t + y):", c.shape)  # Check combined embedding shape
-        
-        # Unpack the first element from the tuple returned by MobileViT
-        x = self.mobilevit(x)[0]  # Extract the first element which is the output tensor
-        print("After MobileViT:", x.shape)  # Check after MobileViT
-        
+        c = t + y  # 시간 및 레이블 임베딩
+
+        # Transformer blocks 통과
+        for block in self.blocks:
+            x = block(x, c)
+
+        # 최종 레이어
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
-        print("Final output shape:", x.shape)  # Final output shape
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
-        half = x[: len(x) // 2]
-        combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
-        eps, rest = model_out[:, :3], model_out[:, 3:]
-        cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = torch.cat([half_eps, half_eps], dim=0)
-        return torch.cat([eps, rest], dim=1)
+    def unpatchify(self, x):
+        c = self.out_channels
+        p = self.x_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+
+        assert h * w == x.shape[1], "Patch 크기 불일치"
+
+        x = x.reshape(shape=(x.shape[0], h, w, p, p, c))
+        x = torch.einsum('nhwpqc->nchpwq', x)
+        return x.reshape(shape=(x.shape[0], c, h * p, h * p))
+
 
 #################################################################################
-#                                   DiT Configs                                  #
+# DiT Configurations with MobileViT
 #################################################################################
 
 def MobileViT_DiT_S_2(**kwargs):
