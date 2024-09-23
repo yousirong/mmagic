@@ -92,3 +92,33 @@ if __name__ == "__main__":
                         help="Optional path to a DiT or DiT_Lightweight checkpoint (default: auto-download a pre-trained model).")
     args = parser.parse_args()
     main(args)
+
+"""
+python sample.py \
+    --model DiT_Lightweight-S/2 \
+    --image-size 256 \
+    --num-classes 1000 \
+    --cfg-scale 4.0 \
+    --num-sampling-steps 250 \
+    --seed 42 \
+    --ckpt /home/juneyonglee/mydata/results/000-DiT_Lightweight-S-2/checkpoints/0800000.pt \
+    --vae ema
+
+python sample.py \
+    --model DiT_Lightweight-S/2 \
+    --image-size 256 \
+    --seed 42 \
+    --ckpt /home/juneyonglee/mydata/results/000-DiT_Lightweight-S-2/checkpoints/0800000.pt \
+
+
+    python sample.py \
+    --model DiT-XL/2 \
+    --image-size 256 \
+    --num-classes 1000 \
+    --cfg-scale 4.0 \
+    --num-sampling-steps 250 \
+    --seed 42 \
+    --vae ema
+
+
+"""

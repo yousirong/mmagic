@@ -38,7 +38,8 @@ def update_ema(ema_model, model, decay=0.9999):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        if name in ema_params:
+            ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 def requires_grad(model, flag=True):
@@ -108,7 +109,8 @@ def main(args):
     dist.init_process_group("nccl")
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    device_id = rank % torch.cuda.device_count()
+    device = torch.device(f'cuda:{device_id}' if torch.cuda.is_available() else 'cpu')
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     torch.cuda.set_device(device)
@@ -146,10 +148,38 @@ def main(args):
     else:
         raise ValueError(f"Model {args.model} not found in available models.")
 
+    # Load pretrained checkpoint (DiT-XL-2)
+    if args.pretrained_ckpt:
+        logger.info(f"Loading pretrained checkpoint from {args.pretrained_ckpt}")
+        pretrained_checkpoint = torch.load(args.pretrained_ckpt, map_location=device)
+
+        # Assume the pretrained checkpoint has a 'model' key
+        if 'model' in pretrained_checkpoint:
+            pretrained_state_dict = pretrained_checkpoint['model']
+        else:
+            pretrained_state_dict = pretrained_checkpoint
+
+        current_state_dict = model.state_dict()
+
+        # Update only matching keys
+        matched_keys = {k: v for k, v in pretrained_state_dict.items() if k in current_state_dict and current_state_dict[k].shape == v.shape}
+        current_state_dict.update(matched_keys)
+        model.load_state_dict(current_state_dict)
+        logger.info(f"Loaded pretrained weights into {args.model} from {args.pretrained_ckpt}")
+
+    # Load model and optimizer from a checkpoint if resuming training
+    if args.resume_ckpt:
+        logger.info(f"Loading checkpoint from {args.resume_ckpt}")
+        checkpoint = torch.load(args.resume_ckpt, map_location=device)
+        model.module.load_state_dict(checkpoint["model"])
+        ema.load_state_dict(checkpoint["ema"])
+        opt.load_state_dict(checkpoint["opt"])
+        logger.info(f"Resumed from checkpoint: {args.resume_ckpt}")
+
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+    model = DDP(model.to(device), device_ids=[device_id])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -267,6 +297,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--pretrained-ckpt", type=str, default="/home/juneyonglee/Desktop/mmagic/configs/DiT/pretrained_models/DiT-XL-2-256x256.pt", help="Path to pretrained model checkpoint")
     all_model_choices = list(DiT_models.keys()) + list(DiT_Lightweight_models.keys())
     parser.add_argument("--model", type=str, choices=all_model_choices, default="DiT_Lightweight-S/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
@@ -278,6 +309,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--resume-ckpt", type=str, default=None, help="Path to a checkpoint to resume from")
     args = parser.parse_args()
     main(args)
 
@@ -296,7 +328,8 @@ torchrun --nproc_per_node=1 \
     --vae ema \
     --num-workers 8 \
     --log-every 100 \
-    --ckpt-every 5000
+    --ckpt-every 5000 \
+    --pretrained-ckpt /home/juneyonglee/Desktop/mmagic/configs/DiT/pretrained_models/DiT-XL-2-256x256.pt
 
 """
 
